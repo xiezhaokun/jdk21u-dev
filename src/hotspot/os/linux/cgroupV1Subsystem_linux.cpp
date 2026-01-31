@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -37,6 +37,47 @@
 /*
  * Set directory to subsystem specific files based
  * on the contents of the mountinfo and cgroup files.
+ *
+ * The method determines whether it runs in
+ * - host mode
+ * - container mode
+ *
+ * In the host mode, _root is equal to "/" and
+ * the subsystem path is equal to the _mount_point path
+ * joined with cgroup_path.
+ *
+ * In the container mode, it can be two possibilities:
+ * - private namespace (cgroupns=private)
+ * - host namespace (cgroupns=host, default mode in cgroup V1 hosts)
+ *
+ * Private namespace is equivalent to the host mode, i.e.
+ * the subsystem path is set by concatenating
+ * _mount_point and cgroup_path.
+ *
+ * In the host namespace, _root is equal to host's cgroup path
+ * of the control group to which the containerized process
+ * belongs to at the moment of creation. The mountinfo and
+ * cgroup files are mirrored from the host, while the subsystem
+ * specific files are mapped directly at _mount_point, i.e.
+ * at /sys/fs/cgroup/<controller>/, the subsystem path is
+ * then set equal to _mount_point.
+ *
+ * A special case of the subsystem path is when a cgroup path
+ * includes a subgroup, when a containerized process was associated
+ * with an existing cgroup, that is different from cgroup
+ * in which the process has been created.
+ * Here, the _root is equal to the host's initial cgroup path,
+ * cgroup_path will be equal to host's new cgroup path.
+ * As host cgroup hierarchies are not accessible in the container,
+ * it needs to be determined which part of cgroup path
+ * is accessible inside container, i.e. mapped under
+ * /sys/fs/cgroup/<controller>/<subgroup>.
+ * In Docker default setup, host's cgroup path can be
+ * of the form: /docker/<CONTAINER_ID>/<subgroup>,
+ * from which only <subgroup> is mapped.
+ * The method trims cgroup path from left, until the subgroup
+ * component is found. The subsystem path will be set to
+ * the _mount_point joined with the subgroup path.
  */
 void CgroupV1Controller::set_subsystem_path(const char* cgroup_path) {
   if (_cgroup_path != nullptr) {
@@ -49,29 +90,43 @@ void CgroupV1Controller::set_subsystem_path(const char* cgroup_path) {
   _cgroup_path = os::strdup(cgroup_path);
   stringStream ss;
   if (_root != nullptr && cgroup_path != nullptr) {
+    ss.print_raw(_mount_point);
     if (strcmp(_root, "/") == 0) {
-      ss.print_raw(_mount_point);
+      // host processes and containers with cgroupns=private
       if (strcmp(cgroup_path,"/") != 0) {
         ss.print_raw(cgroup_path);
       }
-      _path = os::strdup(ss.base());
     } else {
-      if (strcmp(_root, cgroup_path) == 0) {
-        ss.print_raw(_mount_point);
-        _path = os::strdup(ss.base());
-      } else {
-        char *p = strstr((char*)cgroup_path, _root);
-        if (p != nullptr && p == _root) {
-          if (strlen(cgroup_path) > strlen(_root)) {
-            ss.print_raw(_mount_point);
-            const char* cg_path_sub = cgroup_path + strlen(_root);
-            ss.print_raw(cg_path_sub);
-            _path = os::strdup(ss.base());
+      // containers with cgroupns=host, default setting is _root==cgroup_path
+      if (strcmp(_root, cgroup_path) != 0) {
+        if (*cgroup_path != '\0' && strcmp(cgroup_path, "/") != 0) {
+          // When moved to a subgroup, between subgroups, the path suffix will change.
+          const char *suffix = cgroup_path;
+          while (suffix != nullptr) {
+            stringStream pp;
+            pp.print_raw(_mount_point);
+            pp.print_raw(suffix);
+            if (os::file_exists(pp.base())) {
+              ss.print_raw(suffix);
+              if (suffix != cgroup_path) {
+                log_trace(os, container)("set_subsystem_path: cgroup v1 path reduced to: %s.", suffix);
+              }
+              break;
+            }
+            log_trace(os, container)("set_subsystem_path: skipped non-existent directory: %s.", suffix);
+            suffix = strchr(suffix + 1, '/');
           }
         }
       }
     }
+    _path = os::strdup(ss.base());
   }
+}
+
+jlong CgroupV1MemoryController::uses_mem_hierarchy() {
+  julong use_hierarchy;
+  CONTAINER_READ_NUMBER_CHECKED(reader(), "/memory.use_hierarchy", "Use Hierarchy", use_hierarchy);
+  return (jlong)use_hierarchy;
 }
 
 /*
@@ -110,13 +165,13 @@ void verbose_log(julong read_mem_limit, julong host_mem) {
 jlong CgroupV1MemoryController::read_memory_limit_in_bytes(julong phys_mem) {
   julong memlimit;
   CONTAINER_READ_NUMBER_CHECKED(reader(), "/memory.limit_in_bytes", "Memory Limit", memlimit);
-  if (memlimit >= phys_mem) {
-    verbose_log(memlimit, phys_mem);
-    return (jlong)-1;
-  } else {
-    verbose_log(memlimit, phys_mem);
-    return (jlong)memlimit;
+  if (memlimit >= phys_mem && uses_mem_hierarchy()) {
+    CONTAINER_READ_NUMERICAL_KEY_VALUE_CHECKED(reader(), "/memory.stat",
+                                               "hierarchical_memory_limit", "Hierarchical Memory Limit",
+                                               memlimit);
   }
+  verbose_log(memlimit, phys_mem);
+  return (jlong)((memlimit < phys_mem) ? memlimit : -1);
 }
 
 /* read_mem_swap
@@ -134,12 +189,13 @@ jlong CgroupV1MemoryController::read_memory_limit_in_bytes(julong phys_mem) {
 jlong CgroupV1MemoryController::read_mem_swap(julong host_total_memsw) {
   julong memswlimit;
   CONTAINER_READ_NUMBER_CHECKED(reader(), "/memory.memsw.limit_in_bytes", "Memory and Swap Limit", memswlimit);
-  if (memswlimit >= host_total_memsw) {
-    log_trace(os, container)("Memory and Swap Limit is: Unlimited");
-    return (jlong)-1;
-  } else {
-    return (jlong)memswlimit;
+  if (memswlimit >= host_total_memsw && uses_mem_hierarchy()) {
+    CONTAINER_READ_NUMERICAL_KEY_VALUE_CHECKED(reader(), "/memory.stat",
+                                               "hierarchical_memsw_limit", "Hierarchical Memory and Swap Limit",
+                                               memswlimit);
   }
+  verbose_log(memswlimit, host_total_memsw);
+  return (jlong)((memswlimit < host_total_memsw) ? memswlimit : -1);
 }
 
 jlong CgroupV1MemoryController::memory_and_swap_limit_in_bytes(julong host_mem, julong host_swap) {
